@@ -20,6 +20,7 @@ namespace TI4ReplayDownloader
     {
         private const string ConfigFile = "config.json";
         private const string MatchesFile = "matches.txt";
+        private const string MatchesJsonFile = "matches.json";
         private const string DeadFile = "deadlinks.txt";
         private static readonly Regex URLRegex = new Regex(@"<div class=""url"">(.*)</div>");
         private static string _currentSeries = "";
@@ -272,88 +273,79 @@ namespace TI4ReplayDownloader
         {
             var list = new List<MatchOutput>();
             var existinglist = new List<string>();
-            if (File.Exists(MatchesFile))
+            if (File.Exists(MatchesJsonFile))
             {
-                var file = File.ReadAllLines(MatchesFile);
-                existinglist.AddRange(from line in file
-                    select line.Split(new[] {" - "}, StringSplitOptions.None)
-                    into parts
-                    where parts.Length >= 2
-                    select parts[0]);
-                list.AddRange(from line in file
-                    select line.Split(new[] {" - "}, StringSplitOptions.None)
-                    into parts
-                    where parts.Length >= 2
-                    select new MatchOutput
-                    {
-                        MatchId = long.Parse(parts[0]),
-                        StartTime = long.Parse(parts[1]),
-                        RadiantName = parts[2].Split(new[] {" vs "}, StringSplitOptions.None)[0],
-                        DireName = parts[2].Split(new[] {" vs "}, StringSplitOptions.None)[1],
-                        URL = parts[3]
-                    });
+                list = JsonConvert.DeserializeObject<List<MatchOutput>>(File.ReadAllText(MatchesJsonFile));
+                existinglist.AddRange(list.Select(match => match.MatchId.ToString()));
             }
-            using (var wc = new WebClient {Proxy = null})
+            while (true)
             {
-                long lastmatchid = 0;
-                var first = false;
-                ConsoleExt.Log("We are now listing out all matches.");
-                while (true)
+                using (var wc = new WebClient {Proxy = null})
                 {
-                    ConsoleExt.Log("We are starting with {0}.", lastmatchid);
-                    var downloaded =
-                        wc.DownloadString(
-                            "http://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/v1?key=" + _config.APIKey + "&league_id=600&start_at_match_id=" +
-                            lastmatchid);
-                    dynamic jsonobject = JsonConvert.DeserializeObject(downloaded);
-                    foreach (var leagueMatch in jsonobject.result.matches)
+                    long lastmatchid = 0;
+                    var first = false;
+                    ConsoleExt.Log("We are now listing out all matches.");
+                    while (true)
                     {
-                        if (first)
+                        ConsoleExt.Log("We are starting with {0}.", lastmatchid);
+                        var downloaded =
+                            wc.DownloadString(
+                                "http://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/v1?key=" + _config.APIKey +
+                                "&league_id=600&start_at_match_id=" +
+                                lastmatchid);
+                        dynamic jsonobject = JsonConvert.DeserializeObject(downloaded);
+                        foreach (var leagueMatch in jsonobject.result.matches)
                         {
-                            first = false;
-                            continue;
-                        }
-                        if (existinglist.Contains(leagueMatch.match_id.ToString()))
-                        {
-                            ConsoleExt.Log("We have already parsed {0}, we are abandoning", leagueMatch.match_id);
+                            if (first)
+                            {
+                                first = false;
+                                continue;
+                            }
+                            if (existinglist.Contains(leagueMatch.match_id.ToString()))
+                            {
+                                ConsoleExt.Log("We have already parsed {0}, we are abandoning", leagueMatch.match_id);
+                                lastmatchid = leagueMatch.match_id;
+                                continue;
+                            }
+                            existinglist.Add(leagueMatch.match_id.ToString());
+                            ConsoleExt.Log("We are getting {0}.", leagueMatch.match_id);
+                            var match = JsonConvert.DeserializeObject(wc.DownloadString(
+                                "http://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/v1?key=" + _config.APIKey +
+                                "&league_id=600&match_id=" +
+                                leagueMatch.match_id));
+                            var url = wc.DownloadString(_config.MatchURLs + leagueMatch.match_id);
+                            if (!url.Contains("http"))
+                                ConsoleExt.Log("{0} returned {1}.", leagueMatch.match_id, url);
+                            var demoUrl = URLRegex.Match(url).Groups[1].Value;
+                            list.Add(new MatchOutput
+                            {
+                                RadiantName = match.result.radiant_name,
+                                DireName = match.result.dire_name,
+                                MatchId = leagueMatch.match_id,
+                                StartTime = match.result.start_time,
+                                URL = demoUrl,
+                                SeriesId = leagueMatch.series_id,
+                                SeriesType = leagueMatch.series_type
+                            });
                             lastmatchid = leagueMatch.match_id;
-                            continue;
                         }
-                        existinglist.Add(leagueMatch.match_id.ToString());
-                        ConsoleExt.Log("We are getting {0}.", leagueMatch.match_id);
-                        var match = JsonConvert.DeserializeObject(wc.DownloadString(
-                            "http://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/v1?key=" + _config.APIKey + "&league_id=600&match_id=" +
-                            leagueMatch.match_id));
-                        var url = wc.DownloadString(_config.MatchURLs + leagueMatch.match_id);
-                        if (!url.Contains("http"))
-                            ConsoleExt.Log("{0} returned {1}.", leagueMatch.match_id, url);
-                        var demoUrl = URLRegex.Match(url).Groups[1].Value;
-                        list.Add(new MatchOutput
-                        {
-                            RadiantName = match.result.radiant_name,
-                            DireName = match.result.dire_name,
-                            MatchId = leagueMatch.match_id,
-                            StartTime = match.result.start_time,
-                            URL = demoUrl
-                        });
-                        lastmatchid = leagueMatch.match_id;
+                        first = true;
+                        if (jsonobject.result.results_remaining == 0)
+                            break;
                     }
-                    first = true;
-                    if (jsonobject.result.results_remaining == 0)
-                        break;
+                    list.Sort((a, b) => a.StartTime.CompareTo(b.StartTime));
+                    File.WriteAllText(MatchesFile,
+                        list.Aggregate("",
+                            (current, match) =>
+                                current +
+                                string.Format("{0} - {1} - {2} vs {3} - {4}\n", match.MatchId, match.StartTime,
+                                    match.RadiantName,
+                                    match.DireName, match.URL)));
+                    File.WriteAllText(MatchesJsonFile, JsonConvert.SerializeObject(list));
+                    ConsoleExt.Log("Parsed {0} matches.", list.Count);
                 }
-                list.Sort((a, b) => a.StartTime.CompareTo(b.StartTime));
-                File.WriteAllText(MatchesFile,
-                    list.Aggregate("",
-                        (current, match) =>
-                            current +
-                            string.Format("{0} - {1} - {2} vs {3} - {4}\n", match.MatchId, match.StartTime, match.RadiantName,
-                                match.DireName, match.URL)));
-                ConsoleExt.Log("Parsed {0} matches.", list.Count);
+                Thread.Sleep(10 * 60 * 1000);
             }
-            Thread.Sleep(500);
-            Environment.Exit(0);
-            
         }
 
         static void CheckUrls()
@@ -415,6 +407,8 @@ namespace TI4ReplayDownloader
             public long MatchId;
             public long StartTime;
             public string URL;
+            public int SeriesId;
+            public int SeriesType;
         }
     }
 }
